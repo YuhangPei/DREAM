@@ -181,15 +181,14 @@ def train_model(model, train_loader, test_loader, args, train_dataset=None, save
 
     try:
         loss_all = np.zeros((args.num_training_samples, args.epochs))
-        precise_all = np.zeros((args.epochs,2))
         selected_label_confidence = torch.ones(args.num_training_samples, dtype=torch.long) * -1
         selected_label_confidence = selected_label_confidence.to(device)
         conf_num = []
 
         for e in range(args.epochs):
-            if e > args.warmup:
-                aum_threshold = aum_calculator.retrieve_threshold()
-
+            if e >= args.warmup:
+                if e == args.warmup or e % args.switch_sample == 0:
+                    threshold_data_ids = replace_threshold_examples(range(args.num_training_samples), aum_calculator, args)
             # Training step
             if e <= args.warmup:
                 train_accuracy, avg_loss, model_new, feature = warmup_CTW(
@@ -221,9 +220,7 @@ def train_model(model, train_loader, test_loader, args, train_dataset=None, save
                 )
 
             if e >= args.warmup:
-                if e == args.warmup or e % args.switch_sample == 0:
-                    threshold_data_ids = replace_threshold_examples(range(args.num_training_samples), aum_calculator, args)
-                    aum_threshold = aum_calculator.retrieve_threshold()
+                aum_threshold = aum_calculator.retrieve_threshold()
                 select_samples, _ = clean_selection(args, device, train_loader, feature, aum_calculator, aum_threshold,threshold_data_ids)
 
                 # Calculate the accuracy of clean samples
@@ -234,7 +231,6 @@ def train_model(model, train_loader, test_loader, args, train_dataset=None, save
                 batch_mu = math.ceil(noisy_num / clean_num)
 
                 args.batch_mu = batch_mu
-                print(f'select num: {clean_num}, clean_acc: {clean_acc}, noisy num: {noisy_num}, batch_mu: {batch_mu}, threshold_num: {len(threshold_data_ids)}')
                 confident_set_id = torch.where(select_samples == 1)[0].cpu().numpy()
 
             model = model_new
@@ -251,7 +247,7 @@ def train_model(model, train_loader, test_loader, args, train_dataset=None, save
             test_acc_list.append(test_accuracy)
             test_f1s.append(f1)
 
-            print(f'{e + 1} epoch - Train Loss {avg_loss:.4f}\tTrain accuracy {train_accuracy[0]:.4f}\tTest accuracy {test_accuracy:.4f}\tTest f1 {f1:.4f}')
+            print(f'{e + 1} epoch - Train Loss {avg_loss:.4f}\tTrain accuracy {train_accuracy[0]:.4f}\tTest accuracy {test_accuracy:.4f}')
 
     except KeyboardInterrupt:
         print('*' * shutil.get_terminal_size().columns)
@@ -585,8 +581,8 @@ def train_step_CTW(data_loader, model, optimizer, criterion,  args=None,  aum_ca
         noisy_idx = noisy_idx.view(-1)
         threshold_mask = np.isin(noisy_idx, threshold_data_ids)
         threshold_mask = torch.from_numpy(threshold_mask).to(device)
+        mask_noisy_batch=noisy_mask[noisy_idx]
 
-        all_idx=torch.cat((clean_idx,noisy_idx),dim=0)
 
         # Data is placed into the device and shaped
         clean_x, clean_w, clean_s, clean_y = clean_x.to(device), clean_w.to(device).view(batch_size, a, b), clean_s.to(device).view(batch_size, a, b), clean_y.to(device)
@@ -628,8 +624,9 @@ def train_step_CTW(data_loader, model, optimizer, criterion,  args=None,  aum_ca
         out_origin = model.classifier(h_origin.squeeze(-1))
         clean_out = out_origin[:batch_size]
 
+        all_idx=torch.cat((clean_idx,noisy_idx[mask_noisy_batch.bool()]),dim=0)
+        logits_w = torch.cat((logits_clean_w.detach(), logits_noisy_w[mask_noisy_batch.bool()].detach()), dim=0)
 
-        logits_w = torch.cat((logits_clean_w.detach(), logits_noisy_w.detach()), dim=0)
         logits_w_PM = torch.softmax(logits_w, dim=-1)
         # C+1 classes
 
@@ -651,14 +648,13 @@ def train_step_CTW(data_loader, model, optimizer, criterion,  args=None,  aum_ca
             selected_label_confidence[noisy_idx[select_confidence == 1]] = pseudo_lb[select_confidence == 1]
 
         loss_criterion = criterion(logits_clean_w, clean_y).mean()
-        mask_noisy_batch=noisy_mask[noisy_idx]
 
         clean_diff = torch.softmax(logits_clean_w.detach(), 1) - torch.softmax(logits_clean_s.detach(), 1)
         noisy_diff = logits_noisy_w.softmax(1).reshape(batch_size, args.batch_mu, -1).mean(dim=1) - logits_noisy_s.softmax(1).reshape(batch_size, args.batch_mu, -1).mean(dim=1)
         relative_loss = F.mse_loss(noisy_diff, clean_diff.detach(), reduction='mean')
 
         # ;_1
-        model_loss = loss_criterion + args.L_rea * relative_loss + args.L_match * (unsup_loss*mask_noisy_batch).mean()
+        model_loss = loss_criterion + args.L_rea * relative_loss + args.L_match * (unsup_loss).mean()
         noisy_mask[noisy_idx]=0
         optimizer.zero_grad()
         model_loss.backward()

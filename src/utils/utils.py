@@ -1091,8 +1091,6 @@ class AUMCalculator:
         for threshold_example in self.threshold_aum_examples:
             threshold_pool.append(self.threshold_aum_examples[threshold_example][-1])
         threshold_pool.sort(reverse=True)
-        # print(threshold_pool)
-        # return np.mean(threshold_pool)
         return threshold_pool[int((self.num_threshold_examples * self.percentile) // 100)]
 
     def update_aums(self, ids, margins, net=False):
@@ -1134,16 +1132,16 @@ def consistency_loss(logits_s, logits_w, conf_acc, x_ulb_idx, aum_calculator, y_
     both_mask = mask
 
     inverse_mask = (~threshold_mask).int()
-
-    max_idx = max_idx * inverse_mask + threshold_mask * (num_classes - 1)
     saved_both_mask = both_mask
-    both_mask = both_mask * inverse_mask + threshold_mask.float() * (sum(saved_both_mask) / logits_w.shape[0])
 
     select_confidence = max_probs.ge(p_cutoff).long()
 
     select_confidence = select_confidence * inverse_mask
 
-    masked_loss = ce_loss(logits_s, max_idx, use_hard_labels,
+    nois_loss = ce_loss(logits_s, max_idx, use_hard_labels,
                           reduction='none') * both_mask
-
-    return masked_loss, select_confidence, max_idx.long()
+    c1_idx = threshold_mask * (num_classes - 1)
+    e_loss = ce_loss(logits_s, c1_idx, use_hard_labels,
+                          reduction='none') * threshold_mask.float() * (sum(saved_both_mask) / logits_w.shape[0])
+    total_loss = e_loss + nois_loss
+    return total_loss, select_confidence, max_idx.long()

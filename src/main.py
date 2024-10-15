@@ -169,7 +169,7 @@ def parse_args():
                         help='sample num rate')
     parser.add_argument('--switch_sample', default=1, type=int,
                         help='frequency of threshold calculation')
-    parser.add_argument('--apm_threshold_weight', default=0.95, type=int,
+    parser.add_argument('--apm_threshold_weight', default=0.98, type=int,
                         help='weight for threshold calculation')
     parser.add_argument('--mixts_aug_type', default='TimeWarp', choices=['TimeWarp', 'GNoise','Convolve', 'Crop', 'Drift'],
                         help='augmentation type for mixts')
@@ -275,7 +275,7 @@ def main(args, dataset_name=None):
         # ##########################
         saver.make_log(**vars(args))
         ######################################################################################################
-        if args.model in ['CTW_contrast']:
+        if args.model in ['MixTS']:
             df_results = main_wrapper_MixTS(args, x_train, x_test, Y_train_clean, Y_test_clean, saver,seed=seeds[seeds_i])
         elif args.model in ['CTW']:
             df_results = main_wrapper_CTW(args, x_train, x_test, Y_train_clean, Y_test_clean, saver,seed=seeds[seeds_i])
@@ -333,7 +333,6 @@ if __name__ == '__main__':
     else:
         ucr=['ArrowHead','CBF','FaceFour','OSULeaf','Plane','Symbols','Trace',
              'Epilepsy','NATOPS','FingerMovements','EthanolConcentration',  'MelbournePedestrian','FaceDetection']
-
 
     for dataset_name in ucr:
         args = parse_args()
