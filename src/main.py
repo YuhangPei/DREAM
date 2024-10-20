@@ -169,7 +169,7 @@ def parse_args():
                         help='sample num rate')
     parser.add_argument('--switch_sample', default=1, type=int,
                         help='frequency of threshold calculation')
-    parser.add_argument('--apm_threshold_weight', default=0.98, type=int,
+    parser.add_argument('--apm_threshold_weight', default=0.95, type=int,
                         help='weight for threshold calculation')
     parser.add_argument('--mixts_aug_type', default='TimeWarp', choices=['TimeWarp', 'GNoise','Convolve', 'Crop', 'Drift'],
                         help='augmentation type for mixts')

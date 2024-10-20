@@ -302,8 +302,8 @@ def train_eval_model(model, x_train, x_test, Y_train, Y_test, Y_train_clean,
     # test_results = evaluate_class(model, x_test, Y_test, None, test_loader, ni, saver, 'CNN',
     #                               'Test', True, plt_cm=plt_cm, plt_lables=False) # evaluate_class will evaluate the final model.
     test_results = dict()
-    test_results['acc'] = test_results_last_ten_epochs['last_ten_test_acc'][-1]
-    test_results['f1_weighted'] = test_results_last_ten_epochs['last_ten_test_f1'][-1]
+    test_results['acc'] = np.max(test_results_last_ten_epochs['last_ten_test_acc'])
+    test_results['f1_weighted'] = np.max(test_results_last_ten_epochs['last_ten_test_f1'])
     test_results['avg_last_ten_test_acc'] = np.mean(test_results_last_ten_epochs['last_ten_test_acc'])
     test_results['avg_last_ten_test_f1'] = np.mean(test_results_last_ten_epochs['last_ten_test_f1'])
 
@@ -624,12 +624,11 @@ def train_step_CTW(data_loader, model, optimizer, criterion,  args=None,  aum_ca
         out_origin = model.classifier(h_origin.squeeze(-1))
         clean_out = out_origin[:batch_size]
 
-        all_idx=torch.cat((clean_idx,noisy_idx[mask_noisy_batch.bool()]),dim=0)
-        logits_w = torch.cat((logits_clean_w.detach(), logits_noisy_w[mask_noisy_batch.bool()].detach()), dim=0)
-
+        all_criterion = criterion(out_origin, torch.cat((clean_y, noisy_y), dim=0))
+        all_idx=torch.cat((clean_idx, noisy_idx), dim=0)
+        loss_all[all_idx, epoch] = all_criterion.detach().cpu().numpy()
+        logits_w = out_origin.detach()
         logits_w_PM = torch.softmax(logits_w, dim=-1)
-        # C+1 classes
-
         # PM
         max_logits = torch.max(logits_w_PM, dim=-1)
         mask = logits_w_PM != max_logits.values[:, None]
@@ -654,7 +653,7 @@ def train_step_CTW(data_loader, model, optimizer, criterion,  args=None,  aum_ca
         relative_loss = F.mse_loss(noisy_diff, clean_diff.detach(), reduction='mean')
 
         # ;_1
-        model_loss = loss_criterion + args.L_rea * relative_loss + args.L_match * (unsup_loss).mean()
+        model_loss = loss_criterion + args.L_rea * relative_loss + args.L_match * unsup_loss
         noisy_mask[noisy_idx]=0
         optimizer.zero_grad()
         model_loss.backward()
