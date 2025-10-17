@@ -15,6 +15,17 @@ import tsaug
 import time
 from sklearn.metrics import accuracy_score, f1_score
 from scipy.special import softmax
+import torch.backends.cudnn as cudnn
+cudnn.benchmark = True
+
+# Try to import annoy, use brute force method if failed
+try:
+    from annoy import AnnoyIndex
+    ANNOY_AVAILABLE = True
+except ImportError:
+    print("Warning: Annoy library not installed, will use brute force method to build similarity graph")
+    print("Install command: pip install annoy")
+    ANNOY_AVAILABLE = False
 
 from src.models.MultiTaskClassification import NonLinClassifier, MetaModel_AE
 from src.models.model import CNNAE
@@ -25,6 +36,209 @@ import torch.nn.functional as F
 ######################################################################################################
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 columns = shutil.get_terminal_size().columns
+
+def calculate_annoy_trees(dataset_size):
+    """
+    Calculate the number of Annoy trees based on dataset size to ensure certain accuracy
+    """
+    if dataset_size <= 1000:
+        return max(10, int(np.log2(dataset_size)))
+    elif dataset_size <= 10000:
+        return max(20, int(np.log2(dataset_size) * 1.5))
+    elif dataset_size <= 100000:
+        return max(50, int(np.log2(dataset_size) * 2))
+    else:
+        return max(100, int(np.log2(dataset_size) * 2.5))
+
+def build_similarity_graph_bruteforce(feature, k_val, device):
+    """
+    Brute force method to build similarity graph - currently used method
+    """
+    n_samples = feature.shape[0]
+    all_indices = []
+    all_distances = []
+    
+    # Process in batches to avoid memory issues
+    batch_size = 1000
+    for start_idx in range(0, n_samples, batch_size):
+        end_idx = min(start_idx + batch_size, n_samples)
+        batch_indices = torch.arange(start_idx, end_idx, device=device)
+        
+        # Calculate cosine similarity
+        similarity_matrix = F.cosine_similarity(
+            feature[batch_indices].unsqueeze(1), 
+            feature.unsqueeze(0), 
+            dim=2
+        )
+        
+        # Exclude self
+        similarity_matrix[torch.arange(similarity_matrix.size()[0]).to(device), batch_indices] = -1
+        
+        # Get top-k
+        distances, indices = similarity_matrix.topk(k_val, dim=1, largest=True, sorted=True)
+        
+        all_indices.append(indices.cpu().numpy())
+        all_distances.append(distances.cpu().numpy().astype(np.float32))  # Ensure float32 type
+    
+    return np.concatenate(all_indices, axis=0), np.concatenate(all_distances, axis=0)
+
+def build_similarity_graph_annoy(feature, k_val, device):
+    """
+    Build similarity graph using Annoy algorithm
+    """
+    if not ANNOY_AVAILABLE:
+        print("Annoy not available, fallback to brute force method")
+        return build_similarity_graph_bruteforce(feature, k_val, device)
+    
+    n_samples, feature_dim = feature.shape
+    n_trees = calculate_annoy_trees(n_samples)
+    
+    print(f"Using Annoy to build similarity graph: {n_samples} samples, {feature_dim} features, {n_trees} trees")
+    
+    # Convert features to numpy array
+    feature_np = feature.detach().cpu().numpy().astype('float32')
+    
+    # Build Annoy index
+    annoy_index = AnnoyIndex(feature_dim, 'angular')  # Use angular distance, equivalent to cosine similarity
+    
+    for i, vector in enumerate(feature_np):
+        annoy_index.add_item(i, vector)
+    
+    # Build index
+    build_start = time.time()
+    annoy_index.build(n_trees)
+    build_time = time.time() - build_start
+    print(f"Annoy index build completed, time: {build_time:.2f}s")
+    
+    # Query nearest neighbors
+    query_start = time.time()
+    all_indices = []
+    all_distances = []
+    
+    for i in range(n_samples):
+        # Query k_val+1 nearest neighbors (including self)
+        indices, distances = annoy_index.get_nns_by_item(i, k_val + 1, include_distances=True)
+        
+        # Remove self (first result)
+        if indices[0] == i:
+            indices = indices[1:]
+            distances = distances[1:]
+        else:
+            # If self not found, remove the last one
+            indices = indices[:-1]
+            distances = distances[:-1]
+        
+        all_indices.append(indices)
+        all_distances.append(np.array(distances, dtype=np.float32))  # Ensure float32 type
+    
+    query_time = time.time() - query_start
+    print(f"Annoy query completed, time: {query_time:.2f}s")
+    
+    return np.array(all_indices), np.array(all_distances)
+
+def compare_similarity_methods(feature, k_val, device):
+    """
+    Compare performance of two similarity graph construction methods
+    """
+    print("\n" + "="*60)
+    print("Similarity graph construction methods performance comparison")
+    print("="*60)
+    
+    n_samples = feature.shape[0]
+    print(f"Dataset: {n_samples} samples, {feature.shape[1]} features, k={k_val}")
+    
+    # Test brute force method
+    print("\n1. Testing brute force method...")
+    bruteforce_start = time.time()
+    try:
+        bf_indices, bf_distances = build_similarity_graph_bruteforce(feature, k_val, device)
+        bruteforce_time = time.time() - bruteforce_start
+        print(f"Brute force method completed, time: {bruteforce_time:.2f}s")
+        bruteforce_success = True
+    except Exception as e:
+        print(f"Brute force method failed: {e}")
+        bruteforce_time = float('inf')
+        bruteforce_success = False
+    
+    # Test Annoy method
+    print("\n2. Testing Annoy method...")
+    if ANNOY_AVAILABLE:
+        annoy_start = time.time()
+        try:
+            annoy_indices, annoy_distances = build_similarity_graph_annoy(feature, k_val, device)
+            annoy_time = time.time() - annoy_start
+            print(f"Annoy method completed, time: {annoy_time:.2f}s")
+            annoy_success = True
+        except Exception as e:
+            print(f"Annoy method failed: {e}")
+            annoy_time = float('inf')
+            annoy_success = False
+    else:
+        print("Annoy library not available")
+        annoy_time = float('inf')
+        annoy_success = False
+    
+    # Performance comparison
+    print("\n" + "-"*60)
+    print("Performance comparison results:")
+    print("-"*60)
+    
+    if bruteforce_success:
+        print(f"Brute force method: {bruteforce_time:.2f}s")
+    else:
+        print("Brute force method: failed")
+    
+    if annoy_success:
+        print(f"Annoy method: {annoy_time:.2f}s")
+        if bruteforce_success and annoy_time < bruteforce_time:
+            speedup = bruteforce_time / annoy_time
+            print(f"Annoy speedup: {speedup:.1f}x")
+        elif bruteforce_success:
+            slowdown = annoy_time / bruteforce_time
+            print(f"Annoy relative time: {slowdown:.1f}x")
+    else:
+        print("Annoy method: failed")
+    
+    # Accuracy comparison (if both methods succeeded)
+    if bruteforce_success and annoy_success:
+        print(f"\nAccuracy comparison:")
+        # Calculate overlap ratio
+        overlap_scores = []
+        for i in range(min(100, n_samples)):  # Only compare first 100 samples
+            bf_set = set(bf_indices[i])
+            annoy_set = set(annoy_indices[i])
+            overlap = len(bf_set & annoy_set) / k_val
+            overlap_scores.append(overlap)
+        
+        avg_overlap = np.mean(overlap_scores)
+        print(f"Average overlap ratio: {avg_overlap:.3f} ({avg_overlap*100:.1f}%)")
+        
+        if avg_overlap > 0.8:
+            print("✓ Annoy method accuracy is good")
+        elif avg_overlap > 0.6:
+            print("⚠ Annoy method accuracy is average")
+        else:
+            print("✗ Annoy method accuracy is poor")
+    
+    # Recommendation
+    print(f"\nRecommendation:")
+    if not ANNOY_AVAILABLE:
+        print("Recommendation: Install Annoy library for better performance")
+    elif n_samples < 1000:
+        print("Recommendation: Use brute force method (small dataset)")
+    elif annoy_success and annoy_time < bruteforce_time * 0.8:
+        print("Recommendation: Use Annoy method (better performance)")
+    else:
+        print("Recommendation: Use brute force method (more stable)")
+    
+    print("="*60)
+    
+    return {
+        'bruteforce_time': bruteforce_time if bruteforce_success else None,
+        'annoy_time': annoy_time if annoy_success else None,
+        'bruteforce_success': bruteforce_success,
+        'annoy_success': annoy_success
+    }
 
 def replace_threshold_examples(noisy_idx, aum_calculator,args):
   num_threshold_examples = min(int(len(noisy_idx) *args.sample_rate), len(noisy_idx) // args.nbins)
@@ -202,9 +416,13 @@ def train_model(model, train_loader, test_loader, args, train_dataset=None, save
                     args=args
                 )
             else:
+                start_time = time.time()
                 # Create a clean_noisy_data
                 clean_noisy_data_set = clean_noisy_data(args, train_dataset, confident_set_id, args.batch_mu, transform_fn=transform_fn)
-                clean_noisy_data_loader = DataLoader(clean_noisy_data_set, batch_size=args.batch_size, shuffle=True, drop_last=False, num_workers=args.num_workers)
+                clean_noisy_data_time = time.time() - start_time
+                print(f'Clean noisy data time: {clean_noisy_data_time:.2f}s')
+                clean_noisy_data_loader = DataLoader(clean_noisy_data_set, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=args.num_workers)
+                start_time = time.time()
                 train_accuracy, avg_loss, model_new, feature = train_step_CTW(
                     data_loader=clean_noisy_data_loader,
                     model=model,
@@ -218,19 +436,19 @@ def train_model(model, train_loader, test_loader, args, train_dataset=None, save
                     loss_all=loss_all,
                     epoch=e
                 )
-
+                train_step_CTW_time = time.time() - start_time
+                print(f'Train step CTW time: {train_step_CTW_time:.2f}s')
             if e >= args.warmup:
                 aum_threshold = aum_calculator.retrieve_threshold()
-                select_samples, _ = clean_selection(args, device, train_loader, feature, aum_calculator, aum_threshold,threshold_data_ids)
+                start_time = time.time()
+                select_samples, _ = clean_selection(args, device, train_loader, feature, model, aum_calculator, aum_threshold,threshold_data_ids)
+                clean_selection_time = time.time() - start_time
 
                 # Calculate the accuracy of clean samples
-                clean_acc = accuracy_score(y_train_clean[torch.where(select_samples == 1)[0]], y_train[torch.where(select_samples == 1)[0]])
-
-                noisy_num = len(select_samples) - torch.sum(select_samples)
-                clean_num = torch.sum(select_samples)
-                batch_mu = math.ceil(noisy_num / clean_num)
-
-                args.batch_mu = batch_mu
+                clean_indices = torch.where(select_samples == 1)[0].cpu()
+                clean_acc = accuracy_score(y_train_clean[clean_indices], y_train[clean_indices])
+                clean_selection_time = time.time() - start_time
+                print(f'Clean selection time: {clean_selection_time:.2f}s')
                 confident_set_id = torch.where(select_samples == 1)[0].cpu().numpy()
 
             model = model_new
@@ -571,64 +789,55 @@ def train_step_CTW(data_loader, model, optimizer, criterion,  args=None,  aum_ca
 
     model.train()
 
-    features_original = torch.zeros((args.num_training_samples, args.embedding_size)).to(device)
     features_aug = torch.zeros((args.num_training_samples, args.embedding_size)).to(device)
     noisy_mask=torch.ones(args.num_training_samples).to(device)
     for batch_idx, ((clean_x, clean_w, clean_s, clean_y, clean_idx), (noisy_x, noisy_w, noisy_s,noisy_y, noisy_idx)) in enumerate(data_loader):
         batch_size, a, b = clean_x.size()
-
         # Converts the index to the tensor on the device and calculates the threshold mask
         noisy_idx = noisy_idx.view(-1)
         threshold_mask = np.isin(noisy_idx, threshold_data_ids)
         threshold_mask = torch.from_numpy(threshold_mask).to(device)
         mask_noisy_batch=noisy_mask[noisy_idx]
 
-
         # Data is placed into the device and shaped
         clean_x, clean_w, clean_s, clean_y = clean_x.to(device), clean_w.to(device).view(batch_size, a, b), clean_s.to(device).view(batch_size, a, b), clean_y.to(device)
         noisy_x, noisy_w, noisy_s,noisy_y = noisy_x.to(device).view(batch_size * args.batch_mu, a, -1), noisy_w.to(device).view(batch_size * args.batch_mu, a, -1), noisy_s.to(device).view(batch_size * args.batch_mu, a, -1), noisy_y.to(device).view(batch_size * args.batch_mu)
-
         # Update category confidence
         pseudo_counter_confidence = Counter(selected_label_confidence.tolist())
         for i in range(args.nbins):
             classwise_acc_confidence[i] = pseudo_counter_confidence[i] / max(pseudo_counter_confidence.values())
-        classwise_acc_confidence[args.nbins - 1] = 0  # 设置最后一类的置信度为0
-
+        classwise_acc_confidence[args.nbins - 1] = 0  # Set confidence of last class to 0
         # Mixed weakly and strongly supervised samples and their indexes
         takeN_l_weak, takeN_l_strong, takeN_u_weak, takeN_u_strong = 1, 1, args.batch_mu, args.batch_mu
         inputs, global_index_l_weak, global_index_l_strong, global_index_u_weak, global_index_u_strong = interleave(clean_w, clean_s, noisy_w, noisy_s, takeN_l_weak, takeN_l_strong, takeN_u_weak, takeN_u_strong)
         inputs = inputs.float()
-
         # Encoder output features and enhancement
         h = model.encoder(inputs)
         h_copy = h.clone()
         h_copy = torch.cat((h_copy[1:, :, :], h_copy[0, :, :].unsqueeze(0)), dim=0)
         h_copy = (1 - args.pn_strength) * h + args.pn_strength * h_copy
-
         # Storage enhancement features
         features_aug[clean_idx] = h[global_index_l_weak].squeeze(-1)
         features_aug[noisy_idx] = h[global_index_u_weak].squeeze(-1)
-
         # Classifier output
         out = model.classifier(h_copy.squeeze(-1))
         logits_clean_w = out[global_index_l_weak]
         logits_clean_s = out[global_index_l_strong]
         logits_noisy_w = out[global_index_u_weak]
         logits_noisy_s = out[global_index_u_strong]
-
         # Processing the raw input, obtaining the corresponding encoder features and classification outputs
-        x_origin = torch.cat((clean_x, noisy_x), dim=0)
-        h_origin = model.encoder(x_origin)
-        features_original[torch.cat((clean_idx, noisy_idx), dim=0)] = h_origin.squeeze(-1)
+        # x_origin = torch.cat((clean_x, noisy_x), dim=0)
+        # h_origin = model.encoder(x_origin)
+        # ✨ Optimization: Don't save features_original, calculate temporarily in clean_selection
 
-        out_origin = model.classifier(h_origin.squeeze(-1))
-        clean_out = out_origin[:batch_size]
+        # out_origin = model.classifier(h_origin.squeeze(-1))
+        # clean_out = out_origin[:batch_size]
 
-        all_criterion = criterion(out_origin, torch.cat((clean_y, noisy_y), dim=0))
+        # all_criterion = criterion(out_origin, torch.cat((clean_y, noisy_y), dim=0))
         all_idx=torch.cat((clean_idx, noisy_idx), dim=0)
-        loss_all[all_idx, epoch] = all_criterion.detach().cpu().numpy()
-        logits_w = out_origin.detach()
-        logits_w_PM = torch.softmax(logits_w, dim=-1)
+        # loss_all[all_idx, epoch] = all_criterion.detach().cpu().numpy()
+        # logits_w = out_origin.detach()
+        logits_w_PM = torch.softmax(torch.cat((logits_clean_w, logits_noisy_w), dim=0), dim=-1).detach()
         # PM
         max_logits = torch.max(logits_w_PM, dim=-1)
         mask = logits_w_PM != max_logits.values[:, None]
@@ -638,20 +847,17 @@ def train_step_CTW(data_loader, model, optimizer, criterion,  args=None,  aum_ca
         margins = partial - second_largest
         # APM
         ids = all_idx.detach().cpu().numpy()[np.isin(all_idx, threshold_data_ids)]
-        aum_calculator.update_aums(ids, margins.cpu().numpy()[np.isin(all_idx, threshold_data_ids)], net=True)
-
+        aum_calculator.update_aums(ids, margins.detach().cpu().numpy()[np.isin(all_idx, threshold_data_ids)], net=True)
         unsup_loss, select_confidence, pseudo_lb = consistency_loss(
             logits_noisy_s, logits_noisy_w, classwise_acc_confidence, noisy_idx, aum_calculator, clean_y, None, args.nbins, threshold_mask, name='ce', T=1.0, p_cutoff=0.0, use_hard_labels=True, labels=False)
-
-        if noisy_idx[select_confidence == 1].nelement() != 0:
-            selected_label_confidence[noisy_idx[select_confidence == 1]] = pseudo_lb[select_confidence == 1]
-
+        selected_indices = torch.where(select_confidence == 1)[0].cpu()
+        if noisy_idx[selected_indices].nelement() != 0:
+            selected_label_confidence[noisy_idx[selected_indices]] = pseudo_lb[select_confidence == 1]
         loss_criterion = criterion(logits_clean_w, clean_y).mean()
 
         clean_diff = torch.softmax(logits_clean_w.detach(), 1) - torch.softmax(logits_clean_s.detach(), 1)
         noisy_diff = logits_noisy_w.softmax(1).reshape(batch_size, args.batch_mu, -1).mean(dim=1) - logits_noisy_s.softmax(1).reshape(batch_size, args.batch_mu, -1).mean(dim=1)
         relative_loss = F.mse_loss(noisy_diff, clean_diff.detach(), reduction='mean')
-
         # ;_1
         model_loss = loss_criterion + args.L_rea * relative_loss + args.L_match * unsup_loss
         noisy_mask[noisy_idx]=0
@@ -659,37 +865,90 @@ def train_step_CTW(data_loader, model, optimizer, criterion,  args=None,  aum_ca
         model_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
-
         avg_loss += model_loss.item()
 
-        acc1 = torch.eq(torch.argmax(clean_out, 1), clean_y).float()
+        acc1 = torch.eq(torch.argmax(torch.cat((logits_clean_w, logits_noisy_w), dim=0), 1), torch.cat((clean_y, noisy_y), dim=0)).float()
         avg_accuracy += acc1.sum().cpu().numpy()
 
         global_step += 1
 
-    return (avg_accuracy / global_step, 0), avg_loss / global_step, model, features_original
+    # ✨ Only return augmented features, original features calculated temporarily in clean_selection
+    return (avg_accuracy / global_step, 0), avg_loss / global_step, model, features_aug
 
 
-def clean_selection(args, device, trainloader, feature,  aum_calculator=None, aum_threshold=None, threshold_data_ids=None):
+def clean_selection(args, device, trainloader, feature, model, aum_calculator=None, aum_threshold=None, threshold_data_ids=None, use_annoy=False):
+    """
+    Sample selection function - optimized version
+    
+    ✨ Optimization:
+    - feature parameter is now features_aug (augmented features)
+    - Original features calculated temporarily with no_grad in this function
+    - No need to save features_original during training, saving GPU memory
+    
+    Args:
+        feature: Augmented features (features_aug)
+        model: Model for temporarily calculating original features
+        use_annoy: If True use Annoy algorithm, False use brute force method, None auto-select based on dataset size
+    """
     C = args.nbins
     temploader = torch.utils.data.DataLoader(trainloader.dataset, batch_size=args.batch_size * 3, shuffle=False, num_workers=args.num_workers)
     trainNoisyLabels = torch.LongTensor(temploader.dataset.tensors[1]).to(device)
     trainNoisyLabels = torch.cat((trainNoisyLabels, trainNoisyLabels), dim=0)
     probs_norm1 = torch.zeros((len(temploader.dataset.tensors[1]), C)).to(device)
-
+    
+    n_samples = feature.shape[0]
+    
+    # Automatically select similarity graph construction method
+    if use_annoy is None:
+        # Auto-select based on dataset size
+        if n_samples > 5000:
+            use_annoy = True
+            print(f"Large dataset ({n_samples} samples), auto-select Annoy algorithm")
+        else:
+            use_annoy = False
+            print(f"Small dataset ({n_samples} samples), use brute force method")
+    else:
+        method_name = "Annoy algorithm" if use_annoy else "brute force method"
+        print(f"Using specified {method_name} to build similarity graph")
+    
     with torch.no_grad():
+        # ✨ Optimization: Temporarily calculate original features for similarity graph
+        print("Temporarily calculating original features for similarity graph construction...")
+        model.eval()
+        feature_original = torch.zeros_like(feature).to(device)
+        
+        for batch_idx, (inputs, _, index, _) in enumerate(temploader):
+            inputs = inputs.to(device).float()
+            index = index.to(device)
+            # Temporarily calculate original features
+            h_original = model.encoder(inputs).squeeze(-1)
+            feature_original[index] = h_original
+        
+        model.train()
+        
+        # Select similarity graph construction method
+        if use_annoy:
+            graph_start = time.time()
+            all_neighbor_indices, all_similarities = build_similarity_graph_annoy(feature_original, args.k_val, device)
+            graph_time = time.time() - graph_start
+            print(f"Similarity graph construction completed, time: {graph_time:.2f}s")
+        else:
+            graph_start = time.time()
+            all_neighbor_indices, all_similarities = build_similarity_graph_bruteforce(feature_original, args.k_val, device)
+            graph_time = time.time() - graph_start
+            print(f"Similarity graph construction completed, time: {graph_time:.2f}s")
+        
         retrieval_one_hot_train = torch.zeros(args.k_val, C).to(device)
 
         for batch_idx, (inputs, targets, index, _) in enumerate(temploader):
             targets = targets.to(device)
             batchSize = inputs.size(0)
             index = index.to(device)
-            similarity_matrix = F.cosine_similarity(feature[index].unsqueeze(1), feature.unsqueeze(0), dim=2)
-            similarity_matrix[torch.arange(similarity_matrix.size()[0]).to(device), index] = -1
-            dist = similarity_matrix
-
-            # Top-K similar scores and corresponding indexes
-            yd, yi = dist.topk(args.k_val, dim=1, largest=True, sorted=True)
+            
+            # Use pre-computed similarity graph results
+            batch_indices = index.cpu().numpy()
+            yi = torch.from_numpy(all_neighbor_indices[batch_indices]).to(device)
+            yd = torch.from_numpy(all_similarities[batch_indices]).to(device).float()  # Ensure float type
 
             # Replicate the labels per row to select
             candidates = trainNoisyLabels.view(1, -1).expand(batchSize, -1)
@@ -704,7 +963,6 @@ def clean_selection(args, device, trainloader, feature,  aum_calculator=None, au
             probs_corrected = torch.sum(torch.mul(retrieval_one_hot_train.view(batchSize, -1, C), yd_transform.view(batchSize, -1, 1)), 1)
             probs_norm = probs_corrected / torch.sum(probs_corrected, dim=1)[:, None]
             probs_norm1[index] = probs_norm
-
 
             prob_temp = torch.max(probs_norm, dim=-1).values
             mask = probs_norm != prob_temp[:, None]
@@ -727,7 +985,7 @@ def clean_selection(args, device, trainloader, feature,  aum_calculator=None, au
     if args.threshold_type == 0.:
         crt_aums = torch.tensor(crt_aums).to(device)
         threshold = args.apm_threshold_weight * crt_aums.mean() + (1 - args.apm_threshold_weight) * aum_threshold
-        aum_mask = crt_aums.ge(threshold).float()
+        aum_mask = crt_aums.ge(threshold).float().to(device)
     elif args.threshold_type == -1.:
         crt_aums = np.array(crt_aums)
         for cls in range(C):
@@ -744,9 +1002,10 @@ def clean_selection(args, device, trainloader, feature,  aum_calculator=None, au
         threshold = torch.tensor(args.threshold_type).to(device)
         aum_mask = crt_aums.ge(threshold).float()
         # 0 samples may be taken
-        if aum_mask.sum()==0:
-            aum_mask[torch.argmax(crt_aums)]=1
-        elif aum_mask.sum()==len(aum_mask):
-            aum_mask[torch.argmin(crt_aums)]=0
+    if aum_mask.sum()==0:
+        aum_mask[torch.argmax(crt_aums)]=1
+    elif aum_mask.sum()==len(aum_mask):
+        aum_mask[torch.argmin(crt_aums)]=0
 
     return aum_mask, crt_aums
+
