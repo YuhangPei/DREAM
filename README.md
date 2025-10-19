@@ -16,6 +16,8 @@ We evaluate our model on publicly available time-series classification datasets 
 
 All datasets are downloaded automatically during training if they do not exist.
 
+**Note:** If dataset download fails, please manually download the corresponding dataset from [www.timeseriesclassification.com/dataset.php](https://www.timeseriesclassification.com/dataset.php) and place it in the corresponding data_files folder under ucr_data or uea_data directories. For example, place the CBF dataset in `ucr_data/data_files/CBF`.
+
 ## Usage
 To train CTW on 13 benchmark datasets mentioned in this paper, run
 ```bash

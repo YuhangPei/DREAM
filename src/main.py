@@ -167,7 +167,7 @@ def parse_args():
                         help='percentile for threshold calculation')
     parser.add_argument('--sample_rate', default=0.1, type=float,
                         help='sample num rate')
-    parser.add_argument('--switch_sample', default=1, type=int,
+    parser.add_argument('--switch_sample', default=5, type=int,
                         help='frequency of threshold calculation')
     parser.add_argument('--apm_threshold_weight', default=0.95, type=int,
                         help='weight for threshold calculation')
