@@ -870,7 +870,7 @@ def train_step_CTW(data_loader, model, optimizer, criterion,  args=None,  aum_ca
     return (avg_accuracy / global_step, 0), avg_loss / global_step, model, features_aug
 
 
-def clean_selection(args, device, trainloader, feature, model, aum_calculator=None, aum_threshold=None, threshold_data_ids=None, use_annoy=False):
+def clean_selection(args, device, trainloader, feature, model, aum_calculator=None, aum_threshold=None, threshold_data_ids=None, use_annoy=False): # use_annoy=False is the default value, set use_annoy=True to use Annoy algorithm
     """
     Sample selection function - optimized version
     
